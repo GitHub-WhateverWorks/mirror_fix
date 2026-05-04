@@ -15,8 +15,8 @@ class PlaneFitHead(MirrorCorrectionHead):
         boundary_kernel: int = 9,
         robust_iters: int = 4,
         gate_residual_pct: float = 0.02,
-        alpha_min: float = 0.15,
-        alpha_max: float = 0.85,
+        alpha_min: float = 0.5,
+        alpha_max: float = 0.9,
         min_support_points: int = 50,
         require_two_sides: bool = True,
     ):

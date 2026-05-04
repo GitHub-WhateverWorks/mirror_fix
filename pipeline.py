@@ -32,14 +32,15 @@ RUN_MSD_EVAL = False
 
 PAIR_DATASET_DIR = "./img/dataset_pairs"
 PAIR_OUTPUT_DIR = "./eval_outputs_pairs_modular"
-PAIR_MAX_IMAGES = 5
-PAIR_SELECTED_IDS = ["0011"]
+PAIR_MAX_IMAGES = 77
+PAIR_SELECTED_IDS = None
+#PAIR_SELECTED_IDS = ["0011","0006","0008","0028","0046", "0047", "0048","0059", "0016"]#"0011","0006","0008","0028","0046", "0047", "0048","0059","0061","0062","0063","0064","0065","0066","0067","0068","0069","0070","0071","0072","0073","0074","0075","0076","0077",
 
 PAIR_ALIGN_METHOD = "ecc_affine"
 PAIR_ALIGN_ECC_ITERS = 100
 PAIR_ALIGN_ECC_EPS = 1e-5
 PAIR_ALIGN_GAUSSIAN_BLUR = 5
-PAIR_EVAL_USE_ALIGNMENT = True
+PAIR_EVAL_USE_ALIGNMENT = True    
 
 PAIR_EVAL_ON_FULL = True
 PAIR_EVAL_ON_USED_MASK = True
@@ -71,10 +72,12 @@ ARGMAX_REFINE_PERCENTILE = 12.0
 ARGMAX_REFINE_MIN_ABS_THRESH = 1e-5
 
 FILL_MASK_HOLES = True
+MASK_FILL_KERNEL = 7
+MASK_FILL_MAX_RATIO = 0.30
 REMOVE_SMALL_COMPONENTS = True
 MIN_COMPONENT_AREA = 800
 USE_ERODED_PRED_MASK = True
-PRED_ERODE_KERNEL = 9
+PRED_ERODE_KERNEL = 15
 PRED_ERODE_ITERS = 1
 
 
@@ -88,17 +91,50 @@ def safe_mean(vals):
     return float(np.mean(vals))
 
 
-def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+def fill_mask_holes(mask: np.ndarray, kernel_size: int = 5, max_fill_ratio: float = 0.15) -> np.ndarray:
+    """
+    Conservative hole filling.
+
+    Only fills small internal holes instead of flood-filling the whole region.
+
+    kernel_size:
+        small kernel = weaker fill
+
+    max_fill_ratio:
+        if filling adds too many pixels, reject the fill
+    """
     mask_u8 = (mask > 0).astype(np.uint8)
-    h, w = mask_u8.shape[:2]
 
-    flood = mask_u8.copy()
-    floodfill_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(flood, floodfill_mask, (0, 0), 1)
+    if mask_u8.sum() == 0:
+        return mask_u8
 
-    outside = flood
-    holes = ((outside == 0) & (mask_u8 == 0)).astype(np.uint8)
-    return np.maximum(mask_u8, holes).astype(np.uint8)
+    original_pixels = int(mask_u8.sum())
+
+    # small morphological closing
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE,
+        (kernel_size, kernel_size),
+    )
+
+    filled = cv2.morphologyEx(
+        mask_u8,
+        cv2.MORPH_CLOSE,
+        kernel,
+    )
+
+    new_pixels = int(filled.sum())
+    added_pixels = new_pixels - original_pixels
+
+    if original_pixels <= 0:
+        return mask_u8
+
+    added_ratio = added_pixels / float(original_pixels)
+
+    # reject over-aggressive fill
+    if added_ratio > max_fill_ratio:
+        return mask_u8
+
+    return filled.astype(np.uint8)
 
 
 def collect_images(path: str, max_images: int | None = None):
@@ -378,17 +414,21 @@ sys.path.append(REPO_DIR)
 from dinov3.eval.segmentation.inference import make_inference
 from depth_anything_3.api import DepthAnything3
 
-
 def load_segmentor():
     print("[MODEL] Loading segmentor...")
+
+    if DEVICE.startswith("cuda"):
+        torch.cuda.empty_cache()
+
     model = torch.hub.load(
         REPO_DIR,
         "dinov3_vit7b16_ms",
         source="local",
         weights=SEG_WEIGHTS,
         backbone_weights=SEG_BACKBONE_WEIGHTS,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float32,   # important
     )
+
     return model.to(DEVICE).eval()
 
 
@@ -410,8 +450,19 @@ transform = v2.Compose([
 
 
 def segment_with_debug(model, img: Image.Image, seg_mask_mode: str):
+    MAX_SEG_SIDE = 640
+
     orig_w, orig_h = img.size
-    x = transform(img).unsqueeze(0).to(DEVICE)
+    scale = min(1.0, MAX_SEG_SIDE / max(orig_w, orig_h))
+
+    if scale < 1.0:
+        seg_w = int(orig_w * scale)
+        seg_h = int(orig_h * scale)
+        img_for_seg = img.resize((seg_w, seg_h), Image.BILINEAR)
+    else:
+        seg_w, seg_h = orig_w, orig_h
+        img_for_seg = img
+    x = transform(img_for_seg).unsqueeze(0).to(DEVICE)
 
     use_amp = DEVICE.startswith("cuda")
     with torch.inference_mode():
@@ -422,7 +473,7 @@ def segment_with_debug(model, img: Image.Image, seg_mask_mode: str):
                     model,
                     inference_mode="whole",
                     decoder_head_type="m2f",
-                    rescale_to=(orig_h, orig_w),
+                    rescale_to=(seg_h, seg_w),
                     n_output_channels=150,
                     output_activation=partial(F.softmax, dim=1),
                 )
@@ -432,7 +483,7 @@ def segment_with_debug(model, img: Image.Image, seg_mask_mode: str):
                 model,
                 inference_mode="whole",
                 decoder_head_type="m2f",
-                rescale_to=(orig_h, orig_w),
+                rescale_to=(seg_h, seg_w),
                 n_output_channels=150,
                 output_activation=partial(F.softmax, dim=1),
             )
@@ -524,12 +575,53 @@ def choose_raw_mask(seg_debug: dict, seg_mask_mode: str) -> np.ndarray:
 # DA3
 # =========================
 def run_da3(model, path: Path) -> np.ndarray:
-    pred = model.inference(
-        [str(path)],
-        process_res=PROCESS_RES,
-        process_res_method=PROCESS_RES_METHOD,
-    )
-    return pred.depth[0].astype(np.float32)
+    attempts = [
+        (392, "upper_bound_resize"),
+        (448, "upper_bound_resize"),
+        (504, "upper_bound_resize"),
+        (560, "upper_bound_resize"),
+    ]
+
+    last_err = None
+
+    for process_res, method in attempts:
+        try:
+            if DEVICE.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+            with torch.inference_mode():
+                pred = model.inference(
+                    [str(path)],
+                    process_res=process_res,
+                    process_res_method=method,
+                )
+
+            return pred.depth[0].astype(np.float32)
+
+        except RuntimeError as e:
+            last_err = e
+            msg = str(e)
+
+            if DEVICE.startswith("cuda"):
+                torch.cuda.empty_cache()
+
+            print(
+                f"[DA3][WARN] failed for {path.name} "
+                f"process_res={process_res}, method={method}: {msg[:180]}"
+            )
+
+            recoverable = (
+                "unable to find an engine" in msg
+                or "GET was unable" in msg
+                or "CUDNN" in msg.upper()
+                or "CUDA" in msg.upper()
+                or "out of memory" in msg.lower()
+            )
+
+            if not recoverable:
+                raise
+
+    raise RuntimeError(f"DA3 inference failed after all attempts for {path}") from last_err
 
 
 # =========================
@@ -541,9 +633,9 @@ def build_heads():
         if name == "plane":
             heads.append(PlaneFitHead())
         elif name == "gaussian":
-            heads.append(GaussianFillHead(blur_kernel=9, iters=60, alpha=1.0))
+            heads.append(GaussianFillHead(blur_kernel=5, iters=12, alpha=0.22))
         elif name == "diffusion":
-            heads.append(DiffusionFillHead(iters=200, step=0.24))
+            heads.append(DiffusionFillHead(iters=40, step=0.20))
         else:
             raise ValueError(f"Unknown head: {name}")
     return heads
@@ -701,171 +793,307 @@ def init_combo_store():
     }
 
 
+
+
+def compute_depth_metrics(raw_depth, fixed_depth, target_depth, masks: dict):
+    """
+    Clear metric naming for reports/CV:
+    - absolute_depth_deviation = mean absolute depth difference
+    - rmse = root mean squared error
+    """
+    out = {}
+    for name, mask in masks.items():
+        mask = (mask > 0).astype(bool)
+        valid = mask & np.isfinite(raw_depth) & np.isfinite(fixed_depth) & np.isfinite(target_depth)
+        count = int(valid.sum())
+
+        if count == 0:
+            out[name] = {
+                "pixels": 0,
+                "raw_absolute_depth_deviation": None,
+                "fixed_absolute_depth_deviation": None,
+                "delta_absolute_depth_deviation": None,
+                "raw_rmse": None,
+                "fixed_rmse": None,
+                "delta_rmse": None,
+            }
+            continue
+
+        raw_err = raw_depth[valid] - target_depth[valid]
+        fixed_err = fixed_depth[valid] - target_depth[valid]
+
+        raw_abs = float(np.mean(np.abs(raw_err)))
+        fixed_abs = float(np.mean(np.abs(fixed_err)))
+        raw_rmse = float(np.sqrt(np.mean(raw_err ** 2)))
+        fixed_rmse = float(np.sqrt(np.mean(fixed_err ** 2)))
+
+        out[name] = {
+            "pixels": count,
+            "raw_absolute_depth_deviation": raw_abs,
+            "fixed_absolute_depth_deviation": fixed_abs,
+            "delta_absolute_depth_deviation": raw_abs - fixed_abs,
+            "raw_rmse": raw_rmse,
+            "fixed_rmse": fixed_rmse,
+            "delta_rmse": raw_rmse - fixed_rmse,
+        }
+    return out
+
+
 def evaluate_pairs(seg_model, da3_model, heads):
     print("\n========== PAIRS: mirror/covered evaluation ==========")
     os.makedirs(PAIR_OUTPUT_DIR, exist_ok=True)
+
+    pair_output_dir = Path(PAIR_OUTPUT_DIR)
+    panel_dir = pair_output_dir / "six_panels"
+    panel_dir.mkdir(parents=True, exist_ok=True)
 
     samples = collect_pair_samples(PAIR_DATASET_DIR, PAIR_MAX_IMAGES, PAIR_SELECTED_IDS)
     if not samples:
         raise RuntimeError(f"No valid pair samples found in {PAIR_DATASET_DIR}")
 
+    def method_display_name(name: str) -> str:
+        if name == "diffusion":
+            return "propagation"
+        if name == "plane":
+            return "plane_fit"
+        return name
+
+    def mask_display_name(name: str) -> str:
+        if name == "argmax":
+            return "base"
+        if name in ["threshold", "percentile", "argmax_refine"]:
+            return "base_threshold"
+        return name
+
+    def depth_to_color_shared(depth: np.ndarray, lo: float, hi: float) -> np.ndarray:
+        x = depth.astype(np.float32)
+        if hi <= lo + 1e-8:
+            u8 = np.zeros(x.shape, dtype=np.uint8)
+        else:
+            x = np.clip(x, lo, hi)
+            x = (x - lo) / (hi - lo + 1e-8)
+            u8 = (x * 255.0).astype(np.uint8)
+        return cv2.applyColorMap(u8, cv2.COLORMAP_TURBO)
+
+    def add_title(img: np.ndarray, title: str) -> np.ndarray:
+        out = img.copy()
+        h, w = out.shape[:2]
+        header_h = max(44, h // 13)
+        cv2.rectangle(out, (0, 0), (w, header_h), (255, 255, 255), -1)
+        cv2.putText(out, title, (10, int(header_h * 0.72)), cv2.FONT_HERSHEY_SIMPLEX, 0.95, (0, 0, 0), 2, cv2.LINE_AA)
+        return out
+    def calibrate_depth_scale(pred_depth, target_depth, mask=None):
+        """
+        Solve:
+            target ≈ a * pred + b
+
+        using least squares.
+        """
+        if mask is None:
+            valid = np.isfinite(pred_depth) & np.isfinite(target_depth)
+        else:
+            valid = (
+                (mask > 0)
+                & np.isfinite(pred_depth)
+                & np.isfinite(target_depth)
+            )
+
+        if valid.sum() < 20:
+            return pred_depth.astype(np.float32), {
+                "scale": 1.0,
+                "bias": 0.0,
+                "valid_pixels": int(valid.sum()),
+            }
+
+        x = pred_depth[valid].reshape(-1)
+        y = target_depth[valid].reshape(-1)
+
+        A = np.stack([x, np.ones_like(x)], axis=1)
+
+        scale, bias = np.linalg.lstsq(A, y, rcond=None)[0]
+
+        calibrated = scale * pred_depth + bias
+
+        return calibrated.astype(np.float32), {
+            "scale": float(scale),
+            "bias": float(bias),
+            "valid_pixels": int(valid.sum()),
+        }
+    def save_six_depth_panel(out_path: Path, mask_name: str, method_name: str, mirror_rgb: np.ndarray,
+                             covered_rgb_aligned: np.ndarray, target_depth: np.ndarray, raw_depth: np.ndarray,
+                             fixed_depth: np.ndarray, used_mirror_mask: np.ndarray):
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        finite_chunks = []
+        for arr in [target_depth, raw_depth, fixed_depth]:
+            vals = arr[np.isfinite(arr)].reshape(-1)
+            if vals.size > 0:
+                finite_chunks.append(vals)
+        if finite_chunks:
+            valid_vals = np.concatenate(finite_chunks)
+            lo = float(np.percentile(valid_vals, 2.0))
+            hi = float(np.percentile(valid_vals, 98.0))
+            if hi <= lo:
+                lo = float(valid_vals.min())
+                hi = float(valid_vals.max())
+            if hi <= lo:
+                hi = lo + 1.0
+        else:
+            lo, hi = 0.0, 1.0
+
+        mirror_bgr = cv2.cvtColor(mirror_rgb, cv2.COLOR_RGB2BGR)
+        covered_bgr = cv2.cvtColor(covered_rgb_aligned, cv2.COLOR_RGB2BGR)
+        tiles = [
+            add_title(mirror_bgr, "Mirror RGB"),
+            add_title(covered_bgr, "Covered RGB / aligned"),
+            add_title(depth_to_color_shared(target_depth, lo, hi), "GT target depth"),
+            add_title(depth_to_color_shared(raw_depth, lo, hi), "Raw DA3 depth"),
+            add_title(depth_to_color_shared(fixed_depth, lo, hi), f"Fixed depth / {method_name}"),
+            add_title(mask_to_bgr(used_mirror_mask), f"Used mirror mask / {mask_name}"),
+        ]
+        h, w = tiles[0].shape[:2]
+        gap = 10
+        white_v = np.full((h, gap, 3), 255, dtype=np.uint8)
+        white_h = np.full((gap, w * 3 + gap * 2, 3), 255, dtype=np.uint8)
+        row1 = np.hstack([tiles[0], white_v, tiles[1], white_v, tiles[2]])
+        row2 = np.hstack([tiles[3], white_v, tiles[4], white_v, tiles[5]])
+        cv2.imwrite(str(out_path), np.vstack([row1, white_h, row2]))
+
     summaries = {}
     for mask_mode in MASK_MODES_TO_RUN:
-        for head in heads:
-            summaries[f"{mask_mode}__{head.name}"] = init_combo_store()
+        for method in heads:
+            summaries[f"{mask_display_name(mask_mode)}__{method_display_name(method.name)}"] = init_combo_store()
+
+    all_pair_metrics = {}
 
     for sample in samples:
         pair_id = sample["id"]
         print(f"[PAIR] {pair_id}")
-
         mirror_img = Image.open(sample["mirror"]).convert("RGB")
         covered_img = Image.open(sample["covered"]).convert("RGB")
         mirror_np = np.array(mirror_img)
         covered_np = np.array(covered_img)
         H, W = mirror_np.shape[:2]
 
-        raw_depth = run_da3(da3_model, sample["mirror"])
-        covered_depth = run_da3(da3_model, sample["covered"])
-        raw_depth = resize_depth_to_match(raw_depth, (H, W))
-        covered_depth = resize_depth_to_match(covered_depth, covered_np.shape[:2])
-
-        covered_rgb_aligned, covered_depth_aligned, align_info = align_covered_to_mirror(
-            mirror_np, covered_np, covered_depth
-        )
+        raw_depth = resize_depth_to_match(run_da3(da3_model, sample["mirror"]), (H, W))
+        covered_depth = resize_depth_to_match(run_da3(da3_model, sample["covered"]), covered_np.shape[:2])
+        covered_rgb_aligned, covered_depth_aligned, align_info = align_covered_to_mirror(mirror_np, covered_np, covered_depth)
 
         target_depth = blur_depth_if_needed(covered_depth_aligned)
         raw_eval = blur_depth_if_needed(raw_depth)
+        raw_eval, raw_calib = calibrate_depth_scale(
+            raw_eval,
+            target_depth,
+        )
         full_mask = np.ones((H, W), dtype=np.uint8)
 
         for mask_mode in MASK_MODES_TO_RUN:
+            mask_name = mask_display_name(mask_mode)
             seg_debug = segment_with_debug(seg_model, mirror_img, mask_mode)
             argmax_mask = resize_mask_to_match(seg_debug["argmax_mask"], (H, W))
             pred_mask = resize_mask_to_match(seg_debug["pred_mask"], (H, W))
-            mirror_prob = resize_prob_to_match(seg_debug["mirror_prob"], (H, W))
-
-            raw_pred_mask = choose_raw_mask({"argmax_mask": argmax_mask, "pred_mask": pred_mask}, mask_mode)
+            raw_pred_mask = choose_raw_mask({"argmax_mask": argmax_mask, "pred_mask": pred_mask}, mask_mode) 
+            panel_mask = raw_pred_mask.copy()
+            #raw_pred_mask = keep_largest_component(raw_pred_mask)
             if REMOVE_SMALL_COMPONENTS:
                 raw_pred_mask = remove_small_components(raw_pred_mask, MIN_COMPONENT_AREA)
             if FILL_MASK_HOLES:
-                raw_pred_mask = fill_mask_holes(raw_pred_mask)
-
+                raw_pred_mask = fill_mask_holes(
+                    raw_pred_mask,
+                    kernel_size=MASK_FILL_KERNEL,
+                    max_fill_ratio=MASK_FILL_MAX_RATIO,
+                )
             used_pred_mask = raw_pred_mask.copy()
+            ratio = used_pred_mask.sum() / (H * W)
+            if ratio < 0.001 or ratio > 0.35:
+                used_pred_mask[:] = 0
             if USE_ERODED_PRED_MASK:
                 used_pred_mask = erode_mask(used_pred_mask, PRED_ERODE_KERNEL, PRED_ERODE_ITERS)
-
             used_eval_mask = erode_eval_mask_if_needed(used_pred_mask)
 
-            stats = seg_debug["stats"]
-
-            for head in heads:
-                combo_key = f"{mask_mode}__{head.name}"
-                result = head.run(raw_depth, used_pred_mask)
+            for method in heads:
+                method_name = method_display_name(method.name)
+                combo_key = f"{mask_name}__{method_name}"
+                result = method.run(raw_depth, used_pred_mask)
                 fix_eval = blur_depth_if_needed(result.fixed_depth)
+                fix_eval, fix_calib = calibrate_depth_scale(
+                    fix_eval,
+                    target_depth,
+                )
                 changed_eval_mask = erode_eval_mask_if_needed(result.changed_mask)
 
-                mae_raw_all, rmse_raw_all = depth_metrics(raw_eval, target_depth, full_mask)
-                mae_fix_all, rmse_fix_all = depth_metrics(fix_eval, target_depth, full_mask)
-                _append_metric(summaries[combo_key]["all_metrics"], mae_raw_all, mae_fix_all, rmse_raw_all, rmse_fix_all)
+                abs_raw_all, rmse_raw_all = depth_metrics(raw_eval, target_depth, full_mask)
+                abs_fix_all, rmse_fix_all = depth_metrics(fix_eval, target_depth, full_mask)
+                _append_metric(summaries[combo_key]["all_metrics"], abs_raw_all, abs_fix_all, rmse_raw_all, rmse_fix_all)
 
-                mae_raw_used, rmse_raw_used = (
-                    depth_metrics(raw_eval, target_depth, used_eval_mask)
-                    if PAIR_EVAL_ON_USED_MASK else (np.nan, np.nan)
-                )
-                mae_fix_used, rmse_fix_used = (
-                    depth_metrics(fix_eval, target_depth, used_eval_mask)
-                    if PAIR_EVAL_ON_USED_MASK else (np.nan, np.nan)
-                )
-                _append_metric(summaries[combo_key]["used_region_metrics"], mae_raw_used, mae_fix_used, rmse_raw_used, rmse_fix_used)
+                abs_raw_used, rmse_raw_used = depth_metrics(raw_eval, target_depth, used_eval_mask) if PAIR_EVAL_ON_USED_MASK else (np.nan, np.nan)
+                abs_fix_used, rmse_fix_used = depth_metrics(fix_eval, target_depth, used_eval_mask) if PAIR_EVAL_ON_USED_MASK else (np.nan, np.nan)
+                _append_metric(summaries[combo_key]["used_region_metrics"], abs_raw_used, abs_fix_used, rmse_raw_used, rmse_fix_used)
 
-                mae_raw_changed, rmse_raw_changed = (
-                    depth_metrics(raw_eval, target_depth, changed_eval_mask)
-                    if PAIR_EVAL_ON_CHANGED_MASK else (np.nan, np.nan)
-                )
-                mae_fix_changed, rmse_fix_changed = (
-                    depth_metrics(fix_eval, target_depth, changed_eval_mask)
-                    if PAIR_EVAL_ON_CHANGED_MASK else (np.nan, np.nan)
-                )
-                _append_metric(summaries[combo_key]["changed_region_metrics"], mae_raw_changed, mae_fix_changed, rmse_raw_changed, rmse_fix_changed)
+                abs_raw_changed, rmse_raw_changed = depth_metrics(raw_eval, target_depth, changed_eval_mask) if PAIR_EVAL_ON_CHANGED_MASK else (np.nan, np.nan)
+                abs_fix_changed, rmse_fix_changed = depth_metrics(fix_eval, target_depth, changed_eval_mask) if PAIR_EVAL_ON_CHANGED_MASK else (np.nan, np.nan)
+                _append_metric(summaries[combo_key]["changed_region_metrics"], abs_raw_changed, abs_fix_changed, rmse_raw_changed, rmse_fix_changed)
 
-                raw_fix_mae = float(np.mean(np.abs(raw_depth - result.fixed_depth)))
-                raw_cov_mae = float(np.mean(np.abs(raw_depth - covered_depth_aligned)))
-                fix_cov_mae = float(np.mean(np.abs(result.fixed_depth - covered_depth_aligned)))
+                changed_inside_used = ((changed_eval_mask > 0) & (used_eval_mask > 0)).astype(np.uint8)
+                region_metrics = compute_depth_metrics(raw_eval, fix_eval, target_depth, {
+                    "full_image": full_mask,
+                    "used_mirror_mask": used_eval_mask,
+                    "changed_region": changed_eval_mask,
+                    "changed_region_inside_used_mask": changed_inside_used,
+                })
 
-                print(
-                    f"  [{mask_mode} + {head.name}] full MAE {mae_raw_all:.3f}->{mae_fix_all:.3f} "
-                    f"(Δ {mae_raw_all - mae_fix_all:+.3f}) | used MAE {mae_raw_used:.3f}->{mae_fix_used:.3f} "
-                    f"(Δ {mae_raw_used - mae_fix_used:+.3f}) | applied={result.applied}"
-                )
-
-                summaries[combo_key]["per_image"].append({
-                    "id": pair_id,
-                    "mask_mode": mask_mode,
-                    "head": head.name,
+                metric_key = f"{pair_id}__{combo_key}"
+                all_pair_metrics[metric_key] = {
+                    "pair_id": pair_id,
+                    "mask_mode_original": mask_mode,
+                    "mask_mode_display": mask_name,
+                    "method_original": method.name,
+                    "method_display": method_name,
                     "align_info": align_info,
                     "applied": bool(result.applied),
                     "alpha": float(result.alpha),
                     "score": float(result.score) if not np.isnan(result.score) else np.nan,
-                    "argmax_pixels": stats["argmax_pixels"],
-                    "pred_mask_pixels": stats["pred_mask_pixels"],
+                    "argmax_pixels": int((argmax_mask > 0).sum()),
+                    "pred_mask_pixels": int((pred_mask > 0).sum()),
                     "raw_pred_pixels": int((raw_pred_mask > 0).sum()),
                     "used_pred_pixels": int((used_pred_mask > 0).sum()),
                     "changed_pixels": int((result.changed_mask > 0).sum()),
                     "support_pixels": int((result.support_mask > 0).sum()),
-                    "full_mae_raw": mae_raw_all,
-                    "full_mae_fix": mae_fix_all,
-                    "used_mae_raw": mae_raw_used,
-                    "used_mae_fix": mae_fix_used,
-                    "changed_mae_raw": mae_raw_changed,
-                    "changed_mae_fix": mae_fix_changed,
-                    "raw_fix_mae": raw_fix_mae,
-                    "raw_cov_mae": raw_cov_mae,
-                    "fix_cov_mae": fix_cov_mae,
+                    "regions": region_metrics,
+                    "meta": result.meta,
+                }
+
+                summaries[combo_key]["per_image"].append({
+                    "id": pair_id, "mask_mode": mask_name, "method": method_name,
+                    "mask_mode_original": mask_mode, "method_original": method.name,
+                    "align_info": align_info, "applied": bool(result.applied),
+                    "alpha": float(result.alpha),
+                    "score": float(result.score) if not np.isnan(result.score) else np.nan,
+                    "argmax_pixels": int((argmax_mask > 0).sum()),
+                    "pred_mask_pixels": int((pred_mask > 0).sum()),
+                    "raw_pred_pixels": int((raw_pred_mask > 0).sum()),
+                    "used_pred_pixels": int((used_pred_mask > 0).sum()),
+                    "changed_pixels": int((result.changed_mask > 0).sum()),
+                    "support_pixels": int((result.support_mask > 0).sum()),
+                    "full_absolute_depth_deviation_raw": abs_raw_all,
+                    "full_absolute_depth_deviation_fix": abs_fix_all,
+                    "used_absolute_depth_deviation_raw": abs_raw_used,
+                    "used_absolute_depth_deviation_fix": abs_fix_used,
+                    "changed_absolute_depth_deviation_raw": abs_raw_changed,
+                    "changed_absolute_depth_deviation_fix": abs_fix_changed,
+                    "full_rmse_raw": rmse_raw_all, "full_rmse_fix": rmse_fix_all,
+                    "used_rmse_raw": rmse_raw_used, "used_rmse_fix": rmse_fix_used,
+                    "changed_rmse_raw": rmse_raw_changed, "changed_rmse_fix": rmse_fix_changed,
                     "meta": result.meta,
                 })
 
+                print(f"  [{mask_name} + {method_name}] full abs-depth-dev {abs_raw_all:.3f}->{abs_fix_all:.3f} "
+                      f"(Δ {abs_raw_all - abs_fix_all:+.3f}) | used {abs_raw_used:.3f}->{abs_fix_used:.3f} "
+                      f"(Δ {abs_raw_used - abs_fix_used:+.3f}) | applied={result.applied}")
+
                 if SAVE_PANELS:
-                    stats_lines = [
-                        f"pair_id: {pair_id}",
-                        f"mask_mode: {mask_mode}",
-                        f"head: {head.name}",
-                        f"mirror min/mean/max: {stats['mirror_prob_min']:.5f}/{stats['mirror_prob_mean']:.5f}/{stats['mirror_prob_max']:.5f}",
-                        f"argmax pixels: {stats['argmax_pixels']}",
-                        f"pred pixels: {stats['pred_mask_pixels']}",
-                        f"used pred pixels: {int((used_pred_mask > 0).sum())}",
-                        f"changed pixels: {int((result.changed_mask > 0).sum())}",
-                        f"support pixels: {int((result.support_mask > 0).sum())}",
-                        f"align: {align_info.get('align_method')} ok={align_info.get('align_ok')} cc={align_info.get('cc')}",
-                        f"RAW-COV MAE: {raw_cov_mae:.3f}",
-                        f"FIX-COV MAE: {fix_cov_mae:.3f}",
-                        f"RAW-FIX MAE: {raw_fix_mae:.3f}",
-                        f"FULL MAE raw->fix: {mae_raw_all:.3f}->{mae_fix_all:.3f}",
-                        f"USED MAE raw->fix: {mae_raw_used:.3f}->{mae_fix_used:.3f}",
-                        f"CHANGED MAE raw->fix: {mae_raw_changed:.3f}->{mae_fix_changed:.3f}",
-                        f"applied: {result.applied}",
-                        f"alpha: {result.alpha:.3f}",
-                        f"score: {result.score}",
-                    ]
-                    panel_path = Path(PAIR_OUTPUT_DIR) / f"{pair_id}_{mask_mode}_{head.name}_panel.png"
-                    save_pair_panel(
-                        panel_path,
-                        pair_id,
-                        mask_mode,
-                        head.name,
-                        mirror_np,
-                        covered_rgb_aligned,
-                        mirror_prob,
-                        argmax_mask,
-                        pred_mask,
-                        raw_pred_mask,
-                        used_pred_mask,
-                        result.changed_mask,
-                        raw_depth,
-                        result.fixed_depth,
-                        covered_depth_aligned,
-                        result.aux_map,
-                        result.support_mask,
-                        stats_lines,
-                    )
+                    save_six_depth_panel(panel_dir / f"{pair_id}_{mask_name}_{method_name}_six_panel.png",
+                                         mask_name, method_name, mirror_np, covered_rgb_aligned,
+                                         covered_depth_aligned, raw_depth, result.fixed_depth, panel_mask)
 
         if DEVICE.startswith("cuda"):
             torch.cuda.empty_cache()
@@ -873,50 +1101,69 @@ def evaluate_pairs(seg_model, da3_model, heads):
 
     final_summary = {}
     leaderboard = []
-
     for mask_mode in MASK_MODES_TO_RUN:
-        for head in heads:
-            combo_key = f"{mask_mode}__{head.name}"
+        for method in heads:
+            mask_name = mask_display_name(mask_mode)
+            method_name = method_display_name(method.name)
+            combo_key = f"{mask_name}__{method_name}"
             combo_summary = {
                 "processed": len(summaries[combo_key]["per_image"]),
-                "mask_mode": mask_mode,
-                "head": head.name,
+                "mask_mode": mask_name, "method": method_name,
+                "mask_mode_original": mask_mode, "method_original": method.name,
                 "all_images": _summarize_metric(summaries[combo_key]["all_metrics"]),
                 "used_mask_region": _summarize_metric(summaries[combo_key]["used_region_metrics"]),
                 "changed_region": _summarize_metric(summaries[combo_key]["changed_region_metrics"]),
                 "per_image": summaries[combo_key]["per_image"],
             }
             final_summary[combo_key] = combo_summary
-
-            out_json = Path(PAIR_OUTPUT_DIR) / f"pair_eval_summary_{mask_mode}_{head.name}.json"
-            with open(out_json, "w", encoding="utf-8") as f:
+            with open(pair_output_dir / f"pair_eval_summary_{mask_name}_{method_name}.json", "w", encoding="utf-8") as f:
                 json.dump(combo_summary, f, indent=2)
-
             leaderboard.append({
-                "combo": combo_key,
-                "mask_mode": mask_mode,
-                "head": head.name,
-                "full_delta_mae": combo_summary["all_images"]["delta_mae"],
-                "used_delta_mae": combo_summary["used_mask_region"]["delta_mae"],
-                "changed_delta_mae": combo_summary["changed_region"]["delta_mae"],
+                "combo": combo_key, "mask_mode": mask_name, "method": method_name,
+                "full_delta_absolute_depth_deviation": combo_summary["all_images"]["delta_mae"],
+                "used_delta_absolute_depth_deviation": combo_summary["used_mask_region"]["delta_mae"],
+                "changed_delta_absolute_depth_deviation": combo_summary["changed_region"]["delta_mae"],
+                "full_delta_rmse": combo_summary["all_images"]["delta_rmse"],
+                "used_delta_rmse": combo_summary["used_mask_region"]["delta_rmse"],
+                "changed_delta_rmse": combo_summary["changed_region"]["delta_rmse"],
             })
 
-    leaderboard.sort(key=lambda x: (-np.nan_to_num(x["used_delta_mae"], nan=-1e18), -np.nan_to_num(x["full_delta_mae"], nan=-1e18)))
-
+    leaderboard.sort(key=lambda x: (-np.nan_to_num(x["used_delta_absolute_depth_deviation"], nan=-1e18),
+                                    -np.nan_to_num(x["full_delta_absolute_depth_deviation"], nan=-1e18)))
     aggregate = {
         "processed_pairs": len(samples),
-        "mask_modes": MASK_MODES_TO_RUN,
-        "heads": [h.name for h in heads],
+        "mask_modes_original": MASK_MODES_TO_RUN,
+        "mask_modes_display": sorted(list({mask_display_name(x) for x in MASK_MODES_TO_RUN})),
+        "methods_original": [m.name for m in heads],
+        "methods_display": [method_display_name(m.name) for m in heads],
         "leaderboard": leaderboard,
         "combinations": {k: {kk: vv for kk, vv in v.items() if kk != "per_image"} for k, v in final_summary.items()},
     }
-
-    aggregate_json = Path(PAIR_OUTPUT_DIR) / "pair_eval_summary_all_combos.json"
+    aggregate_json = pair_output_dir / "pair_eval_summary_all_combos.json"
     with open(aggregate_json, "w", encoding="utf-8") as f:
         json.dump(aggregate, f, indent=2)
+    metrics_json = pair_output_dir / "pair_depth_metrics_detailed.json"
+    with open(metrics_json, "w", encoding="utf-8") as f:
+        json.dump(all_pair_metrics, f, indent=2)
+    metrics_txt = pair_output_dir / "pair_depth_metrics_detailed.txt"
+    with open(metrics_txt, "w", encoding="utf-8") as f:
+        for key, item in all_pair_metrics.items():
+            f.write(f"{key}\n" + "=" * 90 + "\n")
+            f.write(f"pair_id: {item['pair_id']}\nmask: {item['mask_mode_display']} ({item['mask_mode_original']})\n")
+            f.write(f"method: {item['method_display']} ({item['method_original']})\napplied: {item['applied']}\n")
+            f.write(f"alpha: {item['alpha']}\nscore: {item['score']}\nused_pred_pixels: {item['used_pred_pixels']}\nchanged_pixels: {item['changed_pixels']}\n\n")
+            for region_name, vals in item["regions"].items():
+                f.write(f"[{region_name}]\n")
+                for metric_name, metric_value in vals.items():
+                    f.write(f"{metric_name}: {metric_value}\n")
+                f.write("\n")
+            f.write("\n")
 
+    print(f"\n[PAIR] Saved aggregate summary: {aggregate_json}")
+    print(f"[PAIR] Saved detailed metrics JSON: {metrics_json}")
+    print(f"[PAIR] Saved detailed metrics TXT: {metrics_txt}")
+    print(f"[PAIR] Saved six-panel visualizations: {panel_dir}")
     return final_summary, aggregate
-
 
 def evaluate_segmentor_on_msd(seg_model):
     print("\n========== MSD: segmentor mask evaluation ==========")
@@ -986,8 +1233,13 @@ def evaluate_segmentor_on_msd(seg_model):
 
     return all_results
 
+import json
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
 
-# =========================
+
 # MAIN
 # =========================
 def main():
@@ -1016,7 +1268,7 @@ def main():
 
     print("\n========== DONE ==========")
     if aggregate is not None:
-        print("\nLeaderboard (sorted by used-mask delta MAE):")
+        print("\nLeaderboard (sorted by used-mask absolute depth deviation improvement):")
         print(json.dumps(aggregate["leaderboard"], indent=2))
     if msd_summary is not None:
         print("\nMSD segmentor summary:")
