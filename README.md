@@ -269,39 +269,19 @@ Metrics are evaluated over three regions:
 
 Mean Absolute Depth Deviation (MADD) is defined as:
 
-$$
-\mathrm{MADD}
-=
-\frac{1}{N}
-\sum_{i=1}^{N}
-\left|D_i-D_i^{*}\right|
-$$
+$$\mathrm{MADD} = \frac{1}{N}\sum_{i=1}^{N}\left|D_i-D_i^{*}\right|$$
 
 ## Root Mean Squared Depth Deviation
 
 Root Mean Squared Depth Deviation (RMSDD) is defined as:
 
-$$
-\mathrm{RMSDD}
-=
-\sqrt{
-\frac{1}{N}
-\sum_{i=1}^{N}
-\left(D_i-D_i^{*}\right)^2
-}
-$$
+$$\mathrm{RMSDD} = \sqrt{\frac{1}{N}\sum_{i=1}^{N}\left(D_i-D_i^{*}\right)^2}$$
 
 ## Improvement
 
 Improvement is defined as:
 
-$$
-\Delta E
-=
-E_{\text{raw}}
--
-E_{\text{fixed}}
-$$
+$$\Delta E = E_{\text{raw}} - E_{\text{fixed}}$$
 
 Therefore:
 
@@ -311,18 +291,7 @@ Therefore:
 
 Relative MADD improvement is:
 
-$$
-R_{\mathrm{MADD}}
-=
-\frac{
-\mathrm{MADD}_{\text{raw}}
--
-\mathrm{MADD}_{\text{fixed}}
-}{
-\mathrm{MADD}_{\text{raw}}
-}
-\times100\%
-$$
+$$R_{\mathrm{MADD}} = \frac{\mathrm{MADD}_{\text{raw}}-\mathrm{MADD}_{\text{fixed}}}{\mathrm{MADD}_{\text{raw}}}\times 100\%$$
 
 A recovery is considered successful when the correction head is applied and the used-mask MADD improves.
 
