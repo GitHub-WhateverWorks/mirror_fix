@@ -3,6 +3,7 @@
 > Using Semantic Segmentation and Boundary-Guided Recovery
 
 **Authors:** Bo-Han Ho, Yun-An Chaung, Han-Hsiang Li
+
 **Affiliation:** Department of Computer Science, National Yang Ming
 Chiao Tung University, Hsinchu, Taiwan
 
