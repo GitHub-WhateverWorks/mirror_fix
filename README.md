@@ -137,13 +137,7 @@ $$
 
 The smoothed estimate can then be updated iteratively:
 
-$$
-D_{t+1}(p)
-=
-\alpha\hat D_t(p)
-+
-(1-\alpha)D_t(p)
-$$
+$$D_{t+1}(p)=\alpha\hat{D}_t(p)+(1-\alpha)D_t(p)$$
 
 An early implementation initialized the entire mirror region with one scalar boundary depth. This produced a nearly constant-depth blob.
 
@@ -245,11 +239,7 @@ Independent monocular depth predictions may differ in scale and shift.
 
 Before comparison, an affine depth transformation is fitted:
 
-$$
-D_{\text{ref}}^{*}
-=
-sD_{\text{ref}}+t
-$$
+$$D_{\text{ref}}^{*}=sD_{\text{ref}}+t$$
 
 This places the mirror and covered predictions into a comparable depth coordinate system.
 
